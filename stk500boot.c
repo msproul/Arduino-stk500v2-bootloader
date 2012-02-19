@@ -533,13 +533,13 @@ int main(void)
 	unsigned int	rcvdCharCntr	=	0;
 #endif
 
-#if 1
+	//*	some chips dont set the stack properly
 	asm volatile ( ".set __stack, %0" :: "i" (RAMEND) );
 	asm volatile ( "ldi	16, %0" :: "i" (RAMEND >> 8) );
 	asm volatile ( "out %0,16" :: "i" (AVR_STACK_POINTER_HI_ADDR) );
 	asm volatile ( "ldi	16, %0" :: "i" (RAMEND & 0x0ff) );
 	asm volatile ( "out %0,16" :: "i" (AVR_STACK_POINTER_LO_ADDR) );
-#endif
+
 
 
 	boot_timer	=	0;
