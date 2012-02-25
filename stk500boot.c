@@ -80,11 +80,26 @@ LICENSE:
 //*	Aug 23,	2010	<MLS> Added support for atmega2561
 //*	Aug 26,	2010	<MLS> Removed support for BOOT_BY_SWITCH
 //*	Sep  8,	2010	<MLS> Added support for atmega16
-//*	Nov  9,	2010	<MLS> Fixed bug that 3 !!! in code would cause it to jump to monitor
+//*	Nov  9,	2010	<MLS> Issue 392:Fixed bug that 3 !!! in code would cause it to jump to monitor
 //*	Jun 24,	2011	<MLS> Removed analogRead (was not used)
+//*	Dec 29,	2011	<MLS> Issue 181: added watch dog timmer support
+//*	Dec 29,	2011	<MLS> Issue 505:  bootloader is comparing the seqNum to 1 or the current sequence 
+//*	Jan  1,	2012	<MLS> Issue 543: CMD_CHIP_ERASE_ISP now returns STATUS_CMD_FAILED instead of STATUS_CMD_OK
+//*	Jan  1,	2012	<MLS> Issue 543: Write EEPROM now does something (NOT TESTED)
+//*	Jan  1,	2012	<MLS> Issue 544: stk500v2 bootloader doesn't support reading fuses
 //************************************************************************
 
-
+//************************************************************************
+//*	these are used to test issues
+//*	http://code.google.com/p/arduino/issues/detail?id=505
+//*	Reported by mark.stubbs, Mar 14, 2011
+//*	The STK500V2 bootloader is comparing the seqNum to 1 or the current sequence 
+//*	(IE: Requiring the sequence to be 1 or match seqNum before continuing).  
+//*	The correct behavior is for the STK500V2 to accept the PC's sequence number, and echo it back for the reply message.
+#define	_FIX_ISSUE_505_
+//************************************************************************
+//*	Issue 181: added watch dog timmer support
+#define	_FIX_ISSUE_181_
 
 #include	<inttypes.h>
 #include	<avr/io.h>
@@ -112,7 +127,7 @@ LICENSE:
 	#define EEMWE   2
 #endif
 
-#define	_DEBUG_SERIAL_
+//#define	_DEBUG_SERIAL_
 //#define	_DEBUG_WITH_LEDS_
 
 
@@ -420,7 +435,7 @@ void __jumpMain(void)
 
 	asm volatile ( ".set __stack, %0" :: "i" (RAMEND) );
 
-//*	et stack pointer to top of RAM
+//*	set stack pointer to top of RAM
 
 	asm volatile ( "ldi	16, %0" :: "i" (RAMEND >> 8) );
 	asm volatile ( "out %0,16" :: "i" (AVR_STACK_POINTER_HI_ADDR) );
@@ -509,6 +524,8 @@ uint32_t count = 0;
 	return UART_DATA_REG;
 }
 
+//*	for watch dog timer startup
+void (*app_start)(void) = 0x0000;
 
 
 //*****************************************************************************
@@ -540,14 +557,35 @@ int main(void)
 	asm volatile ( "ldi	16, %0" :: "i" (RAMEND & 0x0ff) );
 	asm volatile ( "out %0,16" :: "i" (AVR_STACK_POINTER_LO_ADDR) );
 
+#ifdef _FIX_ISSUE_181_
+	//************************************************************************
+	//*	Dec 29,	2011	<MLS> Issue #181, added watch dog timmer support
+	//*	handle the watch dog timer
+	uint8_t	mcuStatusReg;
+	mcuStatusReg	=	MCUSR;
+
+	__asm__ __volatile__ ("cli");
+	__asm__ __volatile__ ("wdr");
+	MCUSR	=	0;
+	WDTCSR	|=	_BV(WDCE) | _BV(WDE);
+	WDTCSR	=	0;
+	__asm__ __volatile__ ("sei");
+	// check if WDT generated the reset, if so, go straight to app
+	if (mcuStatusReg & _BV(WDRF))
+	{
+		app_start();
+	}
+	//************************************************************************
+#endif
 
 
 	boot_timer	=	0;
 	boot_state	=	0;
 
 #ifdef BLINK_LED_WHILE_WAITING
-	boot_timeout	=	 90000;		//*	should be about 4 seconds
+//	boot_timeout	=	 90000;		//*	should be about 4 seconds
 //	boot_timeout	=	170000;
+	boot_timeout	=	 20000;		//*	should be about 1 second
 #else
 	boot_timeout	=	3500000; // 7 seconds , approx 2us per step when optimize "s"
 #endif
@@ -678,6 +716,11 @@ int main(void)
 						break;
 
 					case ST_GET_SEQ_NUM:
+					#ifdef _FIX_ISSUE_505_
+						seqNum			=	c;
+						msgParseState	=	ST_MSG_SIZE_1;
+						checksum		^=	c;
+					#else
 						if ( (c == 1) || (c == seqNum) )
 						{
 							seqNum			=	c;
@@ -688,6 +731,7 @@ int main(void)
 						{
 							msgParseState	=	ST_START;
 						}
+					#endif
 						break;
 
 					case ST_MSG_SIZE_1:
@@ -754,20 +798,41 @@ int main(void)
 							unsigned char signatureIndex	=	msgBuffer[6];
 
 							if ( signatureIndex == 0 )
-								answerByte	=	(SIGNATURE_BYTES >>16) & 0x000000FF;
+							{
+								answerByte	=	(SIGNATURE_BYTES >> 16) & 0x000000FF;
+							}
 							else if ( signatureIndex == 1 )
+							{
 								answerByte	=	(SIGNATURE_BYTES >> 8) & 0x000000FF;
+							}
 							else
+							{
 								answerByte	=	SIGNATURE_BYTES & 0x000000FF;
+							}
 						}
 						else if ( msgBuffer[4] & 0x50 )
 						{
-							answerByte	=	0; //read fuse/lock bits not implemented, return dummy value
+						//*	Issue 544: 	stk500v2 bootloader doesn't support reading fuses
+						//*	I cant find the docs that say what these are supposed to be but this was figured out by trial and error
+						//	answerByte	=	boot_lock_fuse_bits_get(GET_LOW_FUSE_BITS);
+						//	answerByte	=	boot_lock_fuse_bits_get(GET_HIGH_FUSE_BITS);
+						//	answerByte	=	boot_lock_fuse_bits_get(GET_EXTENDED_FUSE_BITS);
+							if (msgBuffer[4] == 0x50)
+							{
+								answerByte	=	boot_lock_fuse_bits_get(GET_LOW_FUSE_BITS);
+							}
+							else if (msgBuffer[4] == 0x58)
+							{
+								answerByte	=	boot_lock_fuse_bits_get(GET_HIGH_FUSE_BITS);
+							}
+							else
+							{
+								answerByte	=	0;
+							}
 						}
 						else
 						{
 							answerByte	=	0; // for all others command are not implemented, return dummy value for AVRDUDE happy <Worapoht>
-	//						flag	=	1; // Remark this line for AVRDUDE <Worapoht>
 						}
 						if ( !flag )
 						{
@@ -903,7 +968,8 @@ int main(void)
 				case CMD_CHIP_ERASE_ISP:
 					eraseAddress	=	0;
 					msgLength		=	2;
-					msgBuffer[1]	=	STATUS_CMD_OK;
+				//	msgBuffer[1]	=	STATUS_CMD_OK;
+					msgBuffer[1]	=	STATUS_CMD_FAILED;	//*	isue 543, return FAILED instead of OK
 					break;
 
 				case CMD_LOAD_ADDRESS:
@@ -954,8 +1020,9 @@ int main(void)
 						}
 						else
 						{
-						#if (!defined(__AVR_ATmega1280__) && !defined(__AVR_ATmega2560__)  && !defined(__AVR_ATmega2561__)  && !defined(__AVR_ATmega1284P__)  && !defined(__AVR_ATmega640__))
-					//	#if (defined(EEARL) && defined(EEARH)  && defined(EEMWE)  && defined(EEWE)  && defined(EEDR))
+						//*	issue 543, this should work, It has not been tested.
+					//	#if (!defined(__AVR_ATmega1280__) && !defined(__AVR_ATmega2560__)  && !defined(__AVR_ATmega2561__)  && !defined(__AVR_ATmega1284P__)  && !defined(__AVR_ATmega640__))
+						#if (defined(EEARL) && defined(EEARH)  && defined(EEMWE)  && defined(EEWE)  && defined(EEDR))
 							/* write EEPROM */
 							do {
 								EEARL	=	address;			// Setup EEPROM address
@@ -1158,25 +1225,7 @@ unsigned long	gEepromIndex;
 #define	false	0
 
 #include	"avr_cpunames.h"
-/*
-#if defined(__AVR_ATmega128__)
-	#define	kCPU_NAME	"ATmega128"
-#elif defined(__AVR_ATmega1280__)
-	#define	kCPU_NAME	"ATmega1280"
-#elif defined(__AVR_ATmega1281__)
-	#define	kCPU_NAME	"ATmega1281"
-#elif defined(__AVR_ATmega2560__)
-	#define	kCPU_NAME	"ATmega2560"
-#elif defined(__AVR_ATmega2561__)
-	#define	kCPU_NAME	"ATmega2561"
-#elif defined(__AVR_ATmega1284P__)
-	#define	kCPU_NAME	"ATmega1284P"
-#elif defined(__AVR_ATmega640__)
-	#define	kCPU_NAME	"ATmega640"
-#else
-	#error cpu name not defined
-#endif
-*/
+
 #ifndef _AVR_CPU_NAME_
 	#error cpu name not defined
 #endif
@@ -1577,6 +1626,8 @@ int		errorCount;
 
 
 #if (FLASHEND > 0x08000)
+//*	this includes the interrupt names for the monitor portion. There is no longer enough 
+//*	memory to include this
 //	#include	"avrinterruptnames.h"
 //	#ifndef _INTERRUPT_NAMES_DEFINED_
 //		#warning Interrupt vectors not defined
